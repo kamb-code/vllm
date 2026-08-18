@@ -1004,4 +1004,12 @@ class KVCacheConfig:
         groups can be reinterpreted under a different precision and decode stale
         bytes to NaN/Inf. Uniform-precision caches skip zeroing.
         """
-        return self.has_mamba_layers or self.has_mixed_precision_kv_cache
+        return (
+            self.has_mamba_layers
+            or self.has_mixed_precision_kv_cache
+            # P1b probe (#39146): zero recycled blocks for full attention too
+            or any(
+                isinstance(g.kv_cache_spec, FullAttentionSpec)
+                for g in self.kv_cache_groups
+            )
+        )

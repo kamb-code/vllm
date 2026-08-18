@@ -1205,7 +1205,12 @@ class GPUModelRunner(
             static_forward_context=self.compilation_config.static_forward_context,
         )
 
+    _zeroing_logged = False
+
     def _zero_block_ids(self, block_ids: list[int]) -> None:
+        if not GPUModelRunner._zeroing_logged:
+            GPUModelRunner._zeroing_logged = True
+            logger.info("P1B-PROBE: KV block zeroing ACTIVE, first batch of %d block ids", len(block_ids))
         """Zero the KV cache memory for the given block IDs."""
         if hasattr(self, "_kv_block_zeroer"):
             self._kv_block_zeroer.zero_block_ids(block_ids)
