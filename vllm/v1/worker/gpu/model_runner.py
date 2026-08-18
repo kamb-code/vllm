@@ -1037,6 +1037,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # stale NaN/data from corrupting attention or SSM computation.
         if scheduler_output.new_block_ids_to_zero:
             assert self.kv_block_zeroer is not None
+            if not getattr(self, "_p1b_zero_logged", False):
+                self._p1b_zero_logged = True
+                logger.info("P1B-PROBE: KV block zeroing ACTIVE (V2 runner), first batch of %d block ids", len(scheduler_output.new_block_ids_to_zero))
             self.kv_block_zeroer.zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Apply copy-on-write block copies for partial prefix-cache hits, after
