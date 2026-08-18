@@ -1312,6 +1312,13 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            import os as _os
+            if _os.environ.get("VLLM_COBATCH_LOG"):
+                logger.info(
+                    "COBATCH %s",
+                    {r: n for r, n in scheduler_output.num_scheduled_tokens.items()},
+                )
         return scheduler_output
 
     def _build_kv_connector_meta(
