@@ -1341,6 +1341,62 @@ def test_spec_decode_logprobs(
         assert ref_logprob.decoded_token == spec_logprob.decoded_token
 
 
+def test_prompt_logprobs_stop_before_speculative_padding(monkeypatch):
+    """A one-token prompt has no scored tokens, even in a padded decode batch."""
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    # Step the engine explicitly so the warm request cannot finish before admission.
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+    with VllmRunner(
+        "Qwen/Qwen3-0.6B",
+        revision="c1899de289a04d12100db370d81485cdf75e47ca",
+        dtype="bfloat16",
+        max_model_len=128,
+        max_num_seqs=2,
+        max_num_batched_tokens=64,
+        enable_chunked_prefill=True,
+        enable_prefix_caching=False,
+        async_scheduling=False,
+        enforce_eager=True,
+        gpu_memory_utilization=0.25,
+        speculative_config={
+            "method": "ngram",
+            "prompt_lookup_min": 3,
+            "prompt_lookup_max": 5,
+            "num_speculative_tokens": 4,
+        },
+    ) as vllm_model:
+        engine = vllm_model.llm.llm_engine
+        engine.add_request(
+            "warm",
+            TokensPrompt(prompt_token_ids=[100, 101, 102, 103] * 2),
+            SamplingParams(temperature=0, max_tokens=32, ignore_eos=True),
+        )
+        try:
+            (warm,) = engine.step()
+            assert warm.request_id == "warm"
+            assert not warm.finished
+            assert len(warm.outputs[0].token_ids) == 1
+
+            engine.add_request(
+                "one-token",
+                TokensPrompt(prompt_token_ids=[100]),
+                SamplingParams(temperature=0, max_tokens=1, prompt_logprobs=0),
+            )
+            # With an existing decode, admission pads this prompt to 1 + 4 rows.
+            outputs = {output.request_id: output for output in engine.step()}
+            assert set(outputs) == {"warm", "one-token"}
+            result = outputs["one-token"]
+            assert result.finished
+            assert len(result.outputs[0].token_ids) == 1
+            assert result.prompt_token_ids == [100]
+            assert result.prompt_logprobs is not None
+            assert len(result.prompt_logprobs) == 1
+            assert result.prompt_logprobs == [None]
+        finally:
+            engine.abort_request(["warm", "one-token"])
+
+
 def test_prompt_logprobs_with_chunking_and_preemption():
     """Test that prompt logprobs are correctly returned when using
     both chunked prefill and preemption.
