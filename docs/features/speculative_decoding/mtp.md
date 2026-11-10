@@ -120,6 +120,11 @@ With `draft_lm_head_quantization` (see the notes below) only the listed and
 dynamic rows are quantized (weight-only), not a full copy of the head; the
 dynamic rows' scorer is then stored in FP8.
 
+Successful weight reloads and weight transfers rebuild the copied rows and
+dynamic-row projection in place, preserving CUDA graph storage. Rebuilding this
+derived state requires temporary GPU memory during the update, including for
+kernel-format updates.
+
 ## Notes
 
 - MTP only works for model families that support MTP in vLLM.

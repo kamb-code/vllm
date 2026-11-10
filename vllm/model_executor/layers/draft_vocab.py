@@ -191,6 +191,22 @@ class _Rows(ReplicatedLinear):
             return self.quant_method.apply(self, x)
         return self.kernel.apply_weights(self, x)[..., : self.num_rows]
 
+    def refresh_from(self, fresh: "_Rows") -> None:
+        """Refill processed weights without moving storage captured by graphs."""
+        if type(self.kernel) is not type(fresh.kernel):
+            raise ValueError("The draft-row kernel cannot change during weight reload.")
+        # B12X also holds packed tensors outside the module's state dictionary.
+        packed = getattr(self, "b12x_nvfp4_packed_weight", None)
+        if packed is not None:
+            from vllm.utils.b12x import reuse_packed_weight_storage
+
+            if (
+                reuse_packed_weight_storage(packed, fresh.b12x_nvfp4_packed_weight)
+                is not packed
+            ):
+                raise ValueError("The packed draft-row layout changed during reload.")
+        self.load_state_dict(fresh.state_dict())
+
 
 # The two kernels below compute `x[n] @ weight[ids[n, j]]` for the dynamic
 # rows, reading only the picked rows instead of gathering them into a copy.
@@ -431,6 +447,7 @@ class DraftVocab:
         self.token_ids: torch.Tensor | None = None
         self.rows: _Rows | None = None
         self.num_dynamic_rows = 0
+        self._token_map_quantization: str | None = None
 
     def compute_logits(
         self, lm_head: VocabParallelEmbedding, hidden_states: torch.Tensor
@@ -531,6 +548,7 @@ class DraftVocab:
         self.token_ids = token_ids.to(weight.device)
         self.rows = _Rows(weight[self.token_ids], quantization)
         self.num_dynamic_rows = dynamic_rows
+        self._token_map_quantization = quantization
         if dynamic_rows > 0:
             self._init_dynamic_rows(weight, quantization)
         logger.info(
@@ -541,6 +559,28 @@ class DraftVocab:
             dynamic_rows,
             quantization or weight.dtype,
         )
+
+    @torch.no_grad()
+    def refresh_token_map(self, lm_head: VocabParallelEmbedding) -> None:
+        """Rebuild derived sparse weights in place after the shared head changes."""
+        if self.token_ids is None:
+            return
+        fresh = DraftVocab(self.logits_processor, self.vocab_size)
+        fresh.load_token_map(
+            lm_head,
+            self.token_ids,
+            self.num_dynamic_rows,
+            self._token_map_quantization,
+        )
+        assert self.rows is not None and fresh.rows is not None
+        self.rows.refresh_from(fresh.rows)
+        if self.num_dynamic_rows:
+            self.basis.copy_(fresh.basis)
+            self.scorer.refresh_from(fresh.scorer)
+            for current, replacement in zip(
+                self.gather_rows, fresh.gather_rows, strict=True
+            ):
+                current.copy_(replacement)
 
     def _init_dynamic_rows(self, weight: torch.Tensor, quantization: str | None):
         """Score the rows outside the list with a rank-256 lm_head factor.
@@ -623,3 +663,11 @@ def load_draft_token_map(model: nn.Module, vllm_config: "VllmConfig") -> None:
         spec.draft_token_map_dynamic_rows,
         spec.draft_lm_head_quantization,
     )
+
+
+def refresh_draft_token_maps(model: nn.Module) -> None:
+    """Refresh sparse heads owned by a drafter after a successful weight update."""
+    for module in model.modules():
+        draft_vocab = getattr(module, "draft_vocab", None)
+        if isinstance(draft_vocab, DraftVocab):
+            draft_vocab.refresh_token_map(module.lm_head)

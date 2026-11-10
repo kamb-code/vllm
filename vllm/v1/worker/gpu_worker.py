@@ -66,6 +66,7 @@ from vllm.distributed.weight_transfer import (
 )
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
+from vllm.model_executor.layers.draft_vocab import refresh_draft_token_maps
 from vllm.model_executor.layers.quantization.online.lm_head import (
     restore_quantized_lm_heads,
     share_source_lm_heads,
@@ -661,7 +662,8 @@ class Worker(WorkerBase):
         weights_path: str | None = None,
         is_checkpoint_format: bool = True,
     ) -> None:
-        # Kernel-format weights are copied into place, needing no room.
+        # Kernel-format copies still need scratch space when rebuilding a
+        # sparse draft head derived from the updated weights.
         kv_cache_loan = (
             kv_cache_lent_for_weight_update(
                 getattr(self.model_runner, "extensible_kv_cache", None),
@@ -670,6 +672,10 @@ class Worker(WorkerBase):
                 fail_if_short=True,
             )
             if is_checkpoint_format
+            or (
+                (spec := self.vllm_config.speculative_config) is not None
+                and spec.draft_token_map is not None
+            )
             else nullcontext()
         )
         with kv_cache_loan, set_current_vllm_config(self.vllm_config):
@@ -1768,12 +1774,18 @@ class Worker(WorkerBase):
     def _end_weight_update(self, refresh: bool) -> None:
         assert self.weight_transfer_engine is not None
         self._weight_update_active = False
-        self._weight_update_kv_cache_loan.close()
-        self.weight_transfer_engine.reset_weight_update_target()
-        if self._weight_update_is_draft and (
-            (draft_model := self.get_draft_model()) is not None
-        ):
-            restore_quantized_lm_heads(draft_model, refresh=refresh)
+        try:
+            self.weight_transfer_engine.reset_weight_update_target()
+            if self._weight_update_is_draft:
+                if (draft_model := self.get_draft_model()) is not None:
+                    restore_quantized_lm_heads(draft_model, refresh=refresh)
+                    if refresh:
+                        refresh_draft_token_maps(draft_model)
+            elif refresh:
+                # Weight transfer bypasses GPUModelRunner.reload_weights().
+                self.model_runner.on_target_weights_replaced()
+        finally:
+            self._weight_update_kv_cache_loan.close()
 
     def finish_weight_update(self) -> None:
         """Finish the current weight update session."""
@@ -1787,21 +1799,30 @@ class Worker(WorkerBase):
 
         with set_current_vllm_config(self.vllm_config):
             try:
+                # A retryable failed finish returns its loan, so reacquire it
+                # here. Entering again is safe while a loan is outstanding.
+                draft_model = (
+                    self.get_draft_model() if self._weight_update_is_draft else None
+                )
+                self._weight_update_kv_cache_loan.enter_context(
+                    kv_cache_lent_for_weight_update(
+                        getattr(self.model_runner, "extensible_kv_cache", None),
+                        draft_model or self.model_runner.get_model(),
+                        reclaimable=self._kv_cache_reclaimable,
+                        fail_if_short=False,
+                    )
+                )
                 self.weight_transfer_engine.finish_weight_update()
             except BaseException:
                 if direct_reload_enabled():
                     # a failed direct finish cannot be retried: end the
                     # session so that a new full update can start
                     self._end_weight_update(refresh=False)
+                else:
+                    self._weight_update_kv_cache_loan.close()
                 raise
-            finally:
-                self._weight_update_kv_cache_loan.close()
             self._end_weight_update(refresh=True)
             self._incomplete_weight_updates.discard(self._weight_update_is_draft)
-
-        # Weight transfer bypasses GPUModelRunner.reload_weights().
-        if not self._weight_update_is_draft:
-            self.model_runner.on_target_weights_replaced()
 
     def shutdown(self) -> None:
         gc.unfreeze()
