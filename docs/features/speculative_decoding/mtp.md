@@ -94,6 +94,9 @@ vllm serve <mtp-model> \
 - With `draft_lm_head_quantization` (see the notes below), only the listed and
   picked rows are quantized, not a full copy of the head: the listed rows like
   that copy, the picked rows weight-only.
+- Successful weight reloads and transfers rebuild the copied rows and dynamic
+  projection in place, preserving CUDA graph storage. This requires temporary
+  GPU memory during the update, including for kernel-format updates.
 
 ## Notes
 

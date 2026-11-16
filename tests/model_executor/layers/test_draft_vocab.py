@@ -11,6 +11,7 @@ from vllm.model_executor.layers.draft_vocab import (
     DraftVocab,
     load_draft_token_ids,
     load_draft_token_map,
+    refresh_draft_token_maps,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.online.lm_head import (
@@ -21,6 +22,11 @@ from vllm.model_executor.layers.quantization.online.lm_head import (
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
+)
+from vllm.model_executor.model_loader.reload.layerwise import (
+    finalize_layerwise_reload,
+    initialize_layerwise_reload,
+    record_metadata_for_reloading,
 )
 from vllm.model_executor.models.qwen3_dspark import Qwen3DSparkForCausalLM
 
@@ -86,6 +92,77 @@ def test_token_map_drafts_over_listed_and_picked_rows(
     assert torch.all(kept.sum(dim=-1) == len(DRAFT_IDS) + num_rows)
     torch.testing.assert_close(logits[kept], full[kept], atol=1e-4, rtol=1e-4)
     assert torch.equal(draft_vocab.get_top_tokens(head, hidden), logits.argmax(-1))
+
+
+def _draft_vocab_tensors(draft_vocab: DraftVocab) -> dict[str, torch.Tensor]:
+    assert draft_vocab.token_ids is not None and draft_vocab.rows is not None
+    tensors = {"token_ids": draft_vocab.token_ids}
+    for name in ("rows", "scorer"):
+        module = getattr(draft_vocab, name, None)
+        if module is not None:
+            tensors.update(
+                (f"{name}.{key}", value) for key, value in module.state_dict().items()
+            )
+    if draft_vocab.num_dynamic_rows:
+        tensors.update(basis=draft_vocab.basis, candidate_ids=draft_vocab.candidate_ids)
+        tensors.update(
+            (f"gather_rows.{index}", value)
+            for index, value in enumerate(draft_vocab.gather_rows)
+        )
+    return tensors
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("dynamic_rows", [0, 16])
+def test_token_map_refresh_matches_fresh_after_repeated_reload(
+    default_vllm_config, dist_init, dynamic_rows
+):
+    """Reloads refresh listed logits and dynamic picks at the original addresses."""
+    head = _head()
+    record_metadata_for_reloading(head)
+    drafter = torch.nn.Module()
+    drafter.lm_head = head
+    vocab = drafter.draft_vocab = DraftVocab(LogitsProcessor(VOCAB), VOCAB)
+    vocab.load_token_map(head, torch.tensor(DRAFT_IDS), dynamic_rows)
+    hidden = _hidden(n=4)
+    original = head.weight[:VOCAB].detach().clone()
+    changed = torch.randn(VOCAB, HIDDEN, generator=torch.Generator().manual_seed(17))
+    before = vocab.compute_logits(head, hidden)
+    pointers = {
+        key: value.data_ptr() for key, value in _draft_vocab_tensors(vocab).items()
+    }
+    head_pointer = head.weight.data_ptr()
+
+    for phase, weight in (
+        ("unchanged", original),
+        ("changed", changed),
+        ("restored", original),
+    ):
+        initialize_layerwise_reload(head)
+        head.weight.weight_loader(head.weight, weight)
+        finalize_layerwise_reload(head, None)
+        refresh_quantized_lm_heads(drafter)
+        refresh_draft_token_maps(drafter)
+
+        fresh = DraftVocab(LogitsProcessor(VOCAB), VOCAB)
+        fresh.load_token_map(head, torch.tensor(DRAFT_IDS), dynamic_rows)
+        actual = vocab.compute_logits(head, hidden)
+        assert torch.equal(actual, fresh.compute_logits(head, hidden)), phase
+        assert torch.equal(
+            vocab.get_top_tokens(head, hidden), fresh.get_top_tokens(head, hidden)
+        ), phase
+        assert head.weight.data_ptr() == head_pointer
+        assert {
+            key: value.data_ptr() for key, value in _draft_vocab_tensors(vocab).items()
+        } == pointers
+        if dynamic_rows:
+            assert vocab.gather_rows[0].data_ptr() == head_pointer
+        if phase == "changed":
+            assert not torch.equal(actual[:, DRAFT_IDS], before[:, DRAFT_IDS])
+            if dynamic_rows:
+                assert not torch.equal(actual.isfinite(), before.isfinite())
+        else:
+            assert torch.equal(actual, before), phase
 
 
 requires_cuda = pytest.mark.skipif(
