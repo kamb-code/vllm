@@ -230,3 +230,66 @@ def test_finds_shards_listed_by_the_index(tmp_path, monkeypatch, shard_names, is
     assert use_safetensors == shard_names[0].endswith(".safetensors")
     assert len(fetched) == (use_safetensors and not is_local)
     assert (hash_checkpoint(str(tmp_path)) is not None) == use_safetensors
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("consumer", ["loader", "cache_key"])
+@pytest.mark.parametrize("path_kind", ["parent", "nested_parent", "absolute"])
+def test_index_rejects_paths_outside_checkpoint(tmp_path, consumer, path_kind):
+    checkpoint = tmp_path / "model"
+    (checkpoint / "tensors").mkdir(parents=True)
+    outside = tmp_path / "outside.safetensors"
+    save_file({"outside.weight": torch.ones(1)}, outside)
+    save_file({"inside.weight": torch.zeros(1)}, checkpoint / "inside.safetensors")
+    shard_name = {
+        "parent": "../outside.safetensors",
+        "nested_parent": "tensors/../../outside.safetensors",
+        "absolute": str(outside),
+    }[path_kind]
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "inside.weight": "inside.safetensors",
+                    "outside.weight": shard_name,
+                }
+            }
+        )
+    )
+
+    with pytest.raises(ValueError, match="relative shard paths without"):
+        if consumer == "cache_key":
+            hash_checkpoint(str(checkpoint))
+        else:
+            loader = DefaultModelLoader(LoadConfig(load_format="hf"))
+            source = DefaultModelLoader.Source(str(checkpoint), revision=None)
+            list(loader._get_weights_iterator(source))
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("symlinked", [False, True])
+def test_index_loads_nested_shards_and_hub_cache_links(tmp_path, symlinked):
+    """Index names stay relative even when a cached shard links to a blob."""
+    repo = tmp_path / "models--org--model"
+    checkpoint = repo / "snapshots" / "revision"
+    shard = checkpoint / "tensors" / "weights.safetensors"
+    shard.parent.mkdir(parents=True)
+    expected = torch.arange(4)
+    if symlinked:
+        blob = repo / "blobs" / "content-hash"
+        blob.parent.mkdir()
+        save_file({"layer.weight": expected}, blob)
+        shard.symlink_to(os.path.relpath(blob, shard.parent))
+        assert not shard.resolve().is_relative_to(checkpoint)
+    else:
+        save_file({"layer.weight": expected}, shard)
+    (checkpoint / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"layer.weight": "tensors/weights.safetensors"}})
+    )
+
+    loader = DefaultModelLoader(LoadConfig(load_format="hf"))
+    source = DefaultModelLoader.Source(str(checkpoint), revision=None)
+    weights = dict(loader._get_weights_iterator(source))
+    assert set(weights) == {"layer.weight"}
+    assert torch.equal(weights["layer.weight"], expected)
+    assert hash_checkpoint(str(checkpoint)) is not None

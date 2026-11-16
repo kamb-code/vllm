@@ -600,7 +600,16 @@ def get_safetensors_files_in_index(hf_folder: str, index_file: str) -> list[str]
     # torch state_dict to safetensors file holding that weight.
     with open(index_file_name) as f:
         weight_map = json.load(f)["weight_map"]
-    return sorted({os.path.join(hf_folder, name) for name in weight_map.values()})
+    files = set()
+    for name in weight_map.values():
+        if os.path.isabs(name) or ".." in Path(name).parts:
+            raise ValueError(
+                f"Safetensors index {index_file_name} must use relative shard paths "
+                f"without '..' components; got {name!r}"
+            )
+        # Validate index names, not resolved links: Hub snapshots link to blobs.
+        files.add(os.path.join(hf_folder, name))
+    return sorted(files)
 
 
 # For models like Mistral-7B-v0.3, there are both sharded

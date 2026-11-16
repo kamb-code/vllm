@@ -18,6 +18,16 @@ It'd be better to store the model in a local disk. Additionally, have a look at 
 !!! note
     To isolate the model downloading and loading issue, you can use the `--load-format dummy` argument to skip loading the model weights. This way, you can check if the model downloading and loading is the bottleneck.
 
+## Invalid safetensors index paths
+
+Shard names in `model.safetensors.index.json` must be relative to the model
+directory and contain no `..` path components. Nested paths such as
+`tensors/model-00001-of-00002.safetensors` are supported; absolute paths and
+parent-directory references raise `ValueError`. Correct the index to name
+files within the model directory. Existing file links, including Hugging Face
+snapshot links to cached blobs, remain supported; this check validates index
+names, not the targets of links in a trusted local filesystem.
+
 ## Out of memory
 
 If the model is too large to fit in a single GPU, you will get an out-of-memory (OOM) error. Consider adopting [these options](../configuration/conserving_memory.md) to reduce the memory consumption.
