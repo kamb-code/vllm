@@ -91,6 +91,9 @@ vllm serve <mtp-model> \
   (Qwen3.5, Qwen4Exp, NemotronH) and tensor parallel size 1.
 - The dynamic rows are read per draft token, so the gain shrinks with batch
   size. Measure decode speed and acceptance length at your concurrency.
+- Successful weight reloads and transfers rebuild the copied rows and dynamic
+  projection in place, preserving CUDA graph storage. This requires temporary
+  GPU memory during the update, including for kernel-format updates.
 
 ## Notes
 

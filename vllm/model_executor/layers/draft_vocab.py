@@ -94,6 +94,10 @@ class _Rows(ReplicatedLinear):
         self.weight_loader(self.weight, weight)
         self.quant_method.process_weights_after_loading(self)
 
+    def refresh_from(self, fresh: "_Rows") -> None:
+        """Refill weights without moving storage captured by CUDA graphs."""
+        self.load_state_dict(fresh.state_dict())
+
 
 # The kernel below computes `x[n] @ weight[ids[n, j]]` for the dynamic rows,
 # reading only the picked rows instead of gathering them into a copy. One
@@ -327,6 +331,24 @@ class DraftVocab:
             dynamic_rows,
         )
 
+    @torch.no_grad()
+    def refresh_token_map(self, lm_head: VocabParallelEmbedding) -> None:
+        """Refresh sparse state after the source head reloads."""
+        if self.token_ids is None:
+            return
+        head = getattr(lm_head, "base_layer", lm_head)
+        assert isinstance(head, VocabParallelEmbedding)
+        weight = head.weight[: head.org_vocab_size]
+        assert self.rows is not None
+        self.rows.refresh_from(_Rows(weight[self.token_ids]))
+        if self.num_dynamic_rows:
+            fresh = DraftVocab(self.logits_processor, self.vocab_size)
+            fresh.token_ids = self.token_ids
+            fresh.num_dynamic_rows = self.num_dynamic_rows
+            fresh._init_dynamic_rows(weight)
+            self.basis.copy_(fresh.basis)
+            self.scorer.refresh_from(fresh.scorer)
+
     def _init_dynamic_rows(self, weight: torch.Tensor):
         """Score the rows outside the list with a rank-256 lm_head factor.
 
@@ -400,3 +422,11 @@ def load_draft_token_map(model: nn.Module, vllm_config: "VllmConfig") -> None:
         load_draft_token_ids(spec.draft_token_map, eos_ids),
         spec.draft_token_map_dynamic_rows,
     )
+
+
+def refresh_draft_token_maps(model: nn.Module) -> None:
+    """Refresh sparse state owned by a drafter after a successful weight update."""
+    for module in model.modules():
+        draft_vocab = getattr(module, "draft_vocab", None)
+        if isinstance(draft_vocab, DraftVocab):
+            draft_vocab.refresh_token_map(module.lm_head)
